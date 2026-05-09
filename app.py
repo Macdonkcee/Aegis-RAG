@@ -33,6 +33,17 @@ api_key = st.sidebar.text_input(
     type="password"
 )
 
+# ----------------- FILE UPLOADER WIDGET -----------------
+st.sidebar.markdown("---")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload corporate documents (PDF)", 
+    type=["pdf"], 
+    accept_multiple_files=False
+)
+
+if uploaded_file is not None:
+    st.sidebar.success(f"📄 {uploaded_file.name} uploaded successfully!")
+
 @st.cache_resource
 def get_vector_store():
     # Load documents
