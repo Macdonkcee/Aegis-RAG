@@ -9,7 +9,7 @@ from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.embeddings import FastEmbedEmbeddings
+from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from langchain_core.documents import Document
 
 # Set up page config
