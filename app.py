@@ -4,29 +4,37 @@ sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import streamlit as st
 import os
 import wikipedia
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+import tempfile
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.tools import tool
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader
 
 # Set up page config
 st.set_page_config(page_title="Aegis-RAG Copilot", page_icon="🤖", layout="centered")
 st.title("🤖 Aegis-RAG: Enterprise AI Agent")
-st.write("Ask questions about ACME Corp policies, live stock prices, or general facts!")
+st.write("Ask questions about uploaded documents, corporate policies, live stock prices, or general facts!")
+
+# Initialize chat history
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Initialize active vector retriever
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
 
 # ----------------- ADD THIS SESSION RESET BUTTON ---------------
 if st.sidebar.button("Clear Chat History"):
     st.session_state.chat_history = []
     st.rerun()
 
-# Force the input box to show up in the sidebar. 
-# It will pre-fill with your system key if you have one, or stay blank so you can paste a new one!
+# API Key input field
 api_key = st.sidebar.text_input(
     "Enter your Gemini API Key:",
     value=os.getenv("GEMINI_API_KEY", ""),
@@ -41,12 +49,17 @@ uploaded_file = st.sidebar.file_uploader(
     accept_multiple_files=False
 )
 
-if uploaded_file is not None:
-    st.sidebar.success(f"📄 {uploaded_file.name} uploaded successfully!")
+# Set up local embedding caching
+local_project_cache = os.path.join(os.getcwd(), "local_model_cache")
+embeddings = FastEmbedEmbeddings(
+    model_name="BAAI/bge-small-en-v1.5",
+    cache_dir=local_project_cache
+)
 
+# ----------------- DYNAMIC DOCUMENT PROCESSING -----------------
 @st.cache_resource
-def get_vector_store():
-    # Load documents
+def get_default_vector_store():
+    """Generates the fallback ACME Corp database."""
     docs = [
         Document(
             page_content="ACME Corp remote work policy: Employees can work remotely up to 3 days per week with manager approval.",
@@ -57,35 +70,56 @@ def get_vector_store():
             metadata={"source": "HR Benefits Guide"}
         )
     ]
-    
-    # Force FastEmbed to download directly into your local project directory (bypass Windows Admin blocks!)
-    import os
-    local_project_cache = os.path.join(os.getcwd(), "local_model_cache")
-    
-    embeddings = FastEmbedEmbeddings(
-        model_name="BAAI/bge-small-en-v1.5",
-        cache_dir=local_project_cache
-    )
-    
     return Chroma.from_documents(docs, embeddings)
+
+# Process the uploaded file if there is one
+if uploaded_file is not None:
+    st.sidebar.success(f"📄 {uploaded_file.name} uploaded successfully!")
+    
+    # Process only if we haven't already processed this specific file
+    if "processed_file_name" not in st.session_state or st.session_state.processed_file_name != uploaded_file.name:
+        with st.sidebar.status("🧠 Embedding document...", expanded=True) as embed_status:
+            # 1. Save uploaded bytes to a temp file so PyPDFLoader can read it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(uploaded_file.read())
+                temp_path = temp_file.name
+
+            # 2. Extract and split text
+            loader = PyPDFLoader(temp_path)
+            raw_docs = loader.load()
+            
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            split_docs = text_splitter.split_documents(raw_docs)
+            
+            # 3. Store in transient database and assign to active retriever session
+            db = Chroma.from_documents(split_docs, embeddings)
+            st.session_state.retriever = db
+            st.session_state.processed_file_name = uploaded_file.name
+            embed_status.update(label="✅ Document embedded!", state="complete")
+else:
+    # If file is removed, fall back to default
+    st.session_state.retriever = get_default_vector_store()
+    if "processed_file_name" in st.session_state:
+        del st.session_state.processed_file_name
+
 
 # ----------------- TOOL DEFINITIONS -----------------
 wikipedia.set_user_agent("MyPortfolioBot/1.0 (contact: test@example.com)")
 
 if api_key:
-    # Get our robust, zero-dependency python retriever directly!
-    retriever = get_vector_store()
+    # Use the active session-state retriever (either uploaded file or default ACME)
+    retriever = st.session_state.retriever
 
     @tool
     def query_company_policy(query: str) -> str:
-        """Searches the ACME Corp internal employee benefits database. Use this for questions about company rules, office locations, benefits, or budget."""
-        docs = retriever.similarity_search(query,k=3)
-        results = "\n".join([d.page_content for d in docs])
-        return f"Results from ACME Policy Database:\n{results}"
+        """Searches the internal corporate document database. Use this for questions about company rules, employee guides, benefits, or any uploaded document content."""
+        docs = retriever.similarity_search(query, k=3)
+        results = "\n".join([f"[{d.metadata.get('source', 'Document')}]: {d.page_content}" for d in docs])
+        return f"Results from Document Database:\n{results}"
 
     @tool
     def search_wikipedia(query: str) -> str:
-        """Searches Wikipedia for historical facts, general knowledge, or famous people/companies. Do not use for ACME Corp internal data."""
+        """Searches Wikipedia for historical facts, general knowledge, or famous people/companies. Do not use for corporate internal data."""
         wikipedia_api = WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=300)
         return WikipediaQueryRun(api_wrapper=wikipedia_api).run(query)
 
@@ -104,18 +138,14 @@ if api_key:
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, google_api_key=api_key)
     llm_with_tools = llm.bind_tools(tools)
 
-# ----------------- CHAT INTERFACE -----------------
-# Keep track of conversation history in Streamlit session state
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 
+# ----------------- CHAT INTERFACE -----------------
 # Display previous chat messages
 for message in st.session_state.chat_history:
     if isinstance(message, HumanMessage):
         with st.chat_message("user"):
             st.write(message.content)
     elif isinstance(message, AIMessage) and message.content:
-        # Extract clean text from Gemini blocks if necessary
         clean_text = message.content
         if isinstance(clean_text, list):
             clean_text = "".join([b.get("text", "") for b in clean_text if b.get("type") == "text"])
@@ -139,7 +169,6 @@ if prompt := st.chat_input("Ask me anything..."):
         ] + st.session_state.chat_history
         
         with st.chat_message("assistant"):
-            # Step 1: Wrap the entire reasoning process inside an expandable status widget
             with st.status("🔍 Analyzing your request...", expanded=True) as status:
                 response = llm_with_tools.invoke(messages)
                 messages.append(response)
@@ -149,7 +178,6 @@ if prompt := st.chat_input("Ask me anything..."):
                         tool_name = tool_call["name"]
                         tool_args = tool_call["args"]
                         
-                        # Write the running tool status inside the status container
                         st.write(f"⚙️ Running tool **{tool_name}**...")
                         
                         selected_tool = next(t for t in tools if t.name == tool_name)
@@ -162,15 +190,11 @@ if prompt := st.chat_input("Ask me anything..."):
                     response = llm_with_tools.invoke(messages)
                     messages.append(response)
                 
-                # Update the status bar to show completion and collapse it!
                 status.update(label="✅ Analysis complete!", state="complete", expanded=False)
                 
-            # Step 2: Extract and print final clean output directly to the main chat
             final_output = response.content
             if isinstance(final_output, list):
                 final_output = "".join([b.get("text", "") for b in final_output if b.get("type") == "text"])
             
             st.write(final_output)
-            
-            # Store the final assistant message in history
             st.session_state.chat_history.append(AIMessage(content=final_output))
